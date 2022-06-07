@@ -29,7 +29,7 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
     batch_cnt = 0
     last_t = time.time()
 
-    for _, positive_pair_g, negative_pair_g, blocks in dataloader:
+    for input_nodes, positive_pair_g, blocks in dataloader:
         optimizer.zero_grad()
         pred_pos, pred_neg = model.embed(
             positive_pair_g, negative_pair_g, blocks)
@@ -252,7 +252,7 @@ if __name__ == "__main__":
     train_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                               eids=train_seed,
                                               graph_sampler=sampler,
-                                              batch_size=args.batch_size * 2500,  # TODO: change back
+                                              batch_size=args.batch_size,  # * 2500,  # TODO: change back
                                               negative_sampler=None,
                                               shuffle=False,
                                               drop_last=False,
