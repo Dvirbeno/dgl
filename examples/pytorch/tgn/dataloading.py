@@ -5,6 +5,7 @@ from dgl._dataloading.dataloader import EdgeCollator
 from dgl._dataloading import BlockSampler
 from dgl._dataloading.pytorch import _pop_subgraph_storage, _pop_storages, EdgeDataLoader
 from dgl.base import DGLError
+from dgl import utils
 
 from functools import partial
 import copy
@@ -44,8 +45,10 @@ class TemporalSampler(BlockSampler):
 
     """
 
-    def __init__(self, sampler_type='topk', k=10):
+    def __init__(self, sampler_type='topk', k=10, hops=1):
         super(TemporalSampler, self).__init__(1, False)
+        self.hops = hops
+
         if sampler_type == 'topk':
             self.sampler = partial(
                 dgl.sampling.select_topk, k=k, weight='timestamp')
@@ -59,41 +62,72 @@ class TemporalSampler(BlockSampler):
                          block_id,
                          g,
                          seed_nodes,
-                         timestamp):
+                         timestamp,
+                         etype):
+        full_neighbor_subgraph = dgl.out_subgraph(g, seed_nodes)  # TODO: can we ditch this?
         full_neighbor_subgraph = dgl.in_subgraph(g, seed_nodes)
-        full_neighbor_subgraph = dgl.add_edges(full_neighbor_subgraph,
-                                               seed_nodes, seed_nodes)
 
-        temporal_edge_mask = (full_neighbor_subgraph.edata['timestamp'] < timestamp) + (
-            full_neighbor_subgraph.edata['timestamp'] <= 0)
-        temporal_subgraph = dgl.edge_subgraph(
-            full_neighbor_subgraph, temporal_edge_mask)
+        # not sure why is it required?
+        # full_neighbor_subgraph = dgl.add_edges(full_neighbor_subgraph,
+        #                                        seed_nodes, seed_nodes)
 
-        # Map preserve ID
+        temporal_edge_mask = dict()
+        for edge_type in full_neighbor_subgraph.canonical_etypes:
+            temporal_edge_mask[edge_type] = (full_neighbor_subgraph.edges[edge_type].data['timestamp'] < timestamp) + (
+                    full_neighbor_subgraph.edges[edge_type].data['timestamp'] <= 0)
+
+            # artificially add the original edge
+            eid = full_neighbor_subgraph.edge_ids(seed_nodes[edge_type[0]], seed_nodes[edge_type[-1]], etype=edge_type)
+            temporal_edge_mask[edge_type][eid] = True
+        # temporal_subgraph = dgl.edge_subgraph(full_neighbor_subgraph, temporal_edge_mask, store_ids=False,
+        #                                       relabel_nodes=False)
+        temporal_subgraph = dgl.edge_subgraph(full_neighbor_subgraph, temporal_edge_mask)
+
+        # Get original node ids of the temporal subgraph
         temp2origin = temporal_subgraph.ndata[dgl.NID]
+        # TODO: should we remap and re-assign eids for the sampled subgraph?
+        # Mapping of node ids from root graph to subgraph
+        root2sub_dict = {ntype: dict(zip(node_ids.tolist(), temporal_subgraph.nodes(ntype))) for
+                         ntype, node_ids in temp2origin.items()}
 
-        # The added new edgge will be preserved hence
-        root2sub_dict = dict(
-            zip(temp2origin.tolist(), temporal_subgraph.nodes().tolist()))
-        temporal_subgraph.ndata[dgl.NID] = g.ndata[dgl.NID][temp2origin]
-        seed_nodes = [root2sub_dict[int(n)] for n in seed_nodes]
-        final_subgraph = self.sampler(g=temporal_subgraph, nodes=seed_nodes)
-        final_subgraph.remove_self_loop()
-        return final_subgraph
+        mapped_seed_nodes = {}  # per node type
+        for ntype in root2sub_dict.keys():
+            temporal_subgraph.nodes[ntype].data[dgl.NID] = g.nodes[ntype].data[dgl.NID][temp2origin[ntype]]
+            mapped_seed_nodes[ntype] = torch.stack([root2sub_dict[ntype][int(n)] for n in seed_nodes[ntype]])
+        # temporal_subgraph.ndata[dgl.NID] = g.ndata[dgl.NID][temp2origin]
+        # seed_nodes = {ntype: [root2sub_dict[ntype][int(n)] for n in nodes] for ntype, nodes in seed_nodes.items()}
+        # seed_nodes = [root2sub_dict[int(n)] for n in seed_nodes]
+        final_subgraph = self.sampler(g=temporal_subgraph, nodes=mapped_seed_nodes)
+
+        # TODO: comment for a second
+        # for edge_type in final_subgraph.canonical_etypes:
+        #     eid = final_subgraph.edge_ids(mapped_seed_nodes[edge_type[0]], mapped_seed_nodes[edge_type[-1]],
+        #                                   etype=edge_type)
+        #     final_subgraph.remove_edges(eid, edge_type)
+        return final_subgraph, mapped_seed_nodes
 
         # Temporal Subgraph
+
     def sample_blocks(self,
                       g,
                       seed_nodes,
-                      timestamp):
+                      timestamp,
+                      etype):
+
+        output_nodes = seed_nodes
         blocks = []
-        frontier = self.sampler_frontier(0, g, seed_nodes, timestamp)
-        #block = transform.to_block(frontier,seed_nodes)
-        block = frontier
-        if self.return_eids:
-            self.assign_block_eids(block, frontier)
-        blocks.append(block)
-        return blocks
+
+        # go backwards
+        for block_id in reversed(range(self.hops)):
+            frontier, mapped_seed_nodes = self.sampler_frontier(block_id, g, seed_nodes, timestamp, etype)
+            block = dgl.to_block(frontier, mapped_seed_nodes)
+
+            if self.return_eids:
+                block = self.assign_block_eids(block, frontier)
+            seed_nodes = block.srcdata[dgl.NID]  # might be problematic
+            blocks.insert(0, block)
+
+        return seed_nodes, output_nodes, blocks
 
 
 class TemporalEdgeCollator(EdgeCollator):
@@ -170,6 +204,62 @@ class TemporalEdgeCollator(EdgeCollator):
     Please refers to examples/pytorch/tgn/train.py
 
     """
+
+    def _collate(self, items):
+        if isinstance(items[0], tuple):
+            # returns a list of pairs: group them by node types into a dict
+            items = utils.group_as_dict(items)
+        items = utils.prepare_tensor_or_dict(self.g_sampling, items, 'items')
+
+        # Here node id will not change
+        pair_graph = self.g.edge_subgraph(items, relabel_nodes=False)
+        induced_edges = pair_graph.edata[dgl.EID]
+
+        pair_graph = dgl.transforms.compact_graphs(
+            [pair_graph])[0]
+
+        # Need to remap id
+        for ntype in self.g.ntypes:
+            pair_graph.nodes[ntype].data[dgl.NID] = pair_graph.nodes(ntype)
+        for etype in induced_edges.keys():
+            pair_graph.edges[etype].data[dgl.EID] = induced_edges[etype]
+
+        batch_graphs = []
+        nodes_id = []
+        timestamps = []
+
+        for etype in items.keys():
+            for i, edge in enumerate(
+                    zip(self.g.edges(etype=etype)[0][items[etype]], self.g.edges(etype=etype)[1][items[etype]])):
+                # TODO: LOSE THIS
+                if i < 499001:
+                    continue
+
+                ts = pair_graph.edges[etype].data['timestamp'][i]
+                timestamps.append(ts)
+                subg = self.graph_sampler.sample_blocks(self.g_sampling,
+                                                        {etype[0]: edge[0].unsqueeze(0),
+                                                         etype[-1]: edge[1].unsqueeze(0)},
+                                                        timestamp=ts,
+                                                        etype=etype)[0]
+
+                subg.ndata['timestamp'] = ts.repeat(subg.num_nodes())
+                nodes_id.append(subg.srcdata[dgl.NID])
+                batch_graphs.append(subg)
+
+        for i, edge in enumerate(zip(self.g.edges()[0][items], self.g.edges()[1][items])):
+            ts = pair_graph.edata['timestamp'][i]
+            timestamps.append(ts)
+            subg = self.graph_sampler.sample_blocks(self.g_sampling,
+                                                    list(edge),
+                                                    timestamp=ts)[0]
+            subg.ndata['timestamp'] = ts.repeat(subg.num_nodes())
+            nodes_id.append(subg.srcdata[dgl.NID])
+            batch_graphs.append(subg)
+
+        blocks = [dgl.batch(batch_graphs)]
+        input_nodes = torch.cat(nodes_id)
+        return input_nodes, pair_graph, blocks
 
     def _collate_with_negative_sampling(self, items):
         items = _prepare_tensor(self.g_sampling, items, 'items', False)
@@ -289,6 +379,7 @@ class TemporalEdgeDataLoader(EdgeDataLoader):
 
     def __iter__(self):
         return iter(self.dataloader)
+
 
 # ====== Fast Mode ======
 
@@ -416,7 +507,7 @@ class FastTemporalSampler(BlockSampler):
         dense_id = torch.arange(nodes.size(0), device=nodes.device) % self.k
         dense_id += self.__assoc__[nodes].mul_(self.k)
 
-        dense_e_id = e_id.new_full((n_id.numel() * self.k, ), -1)
+        dense_e_id = e_id.new_full((n_id.numel() * self.k,), -1)
         dense_e_id[dense_id] = e_id
         dense_e_id = dense_e_id.view(-1, self.k)
 
@@ -627,12 +718,14 @@ class SimpleTemporalSampler(BlockSampler):
         fanout = self.fanouts[block_id]
         # List of neighbors to sample per edge type for each GNN layer, starting from the first layer.
         g = dgl.in_subgraph(g, seed_nodes)
-        g.remove_edges(torch.where(g.edata['timestamp'] > self.ts)[0])  # Deleting the the edges that happen after the current timestamp
+        g.remove_edges(torch.where(g.edata['timestamp'] > self.ts)[
+                           0])  # Deleting the the edges that happen after the current timestamp
 
         if fanout is None:  # full neighborhood sampling
             frontier = g
         else:
-            frontier = dgl.sampling.select_topk(g, fanout, 'timestamp', seed_nodes)  # most recent timestamp edge sampling
+            frontier = dgl.sampling.select_topk(g, fanout, 'timestamp',
+                                                seed_nodes)  # most recent timestamp edge sampling
         self.frontiers[block_id] = frontier  # save frontier
         return frontier
 
@@ -705,19 +798,21 @@ class SimpleTemporalEdgeCollator(EdgeCollator):
         A set of builtin negative samplers are provided in
         :ref:`the negative sampling module <api-dataloading-negative-sampling>`.
     '''
+
     def __init__(self, g, eids, graph_sampler, g_sampling=None, exclude=None,
-                reverse_eids=None, reverse_etypes=None, negative_sampler=None):
+                 reverse_eids=None, reverse_etypes=None, negative_sampler=None):
         super(SimpleTemporalEdgeCollator, self).__init__(g, eids, graph_sampler,
-                                                         g_sampling, exclude, reverse_eids, reverse_etypes, negative_sampler)
+                                                         g_sampling, exclude, reverse_eids, reverse_etypes,
+                                                         negative_sampler)
         self.n_layer = len(self.graph_sampler.fanouts)
 
-    def collate(self,items):
+    def collate(self, items):
         '''
         items: edge id in graph g.
         We sample iteratively k-times and batch them into one single subgraph.
         '''
-        current_ts = self.g.edata['timestamp'][items[0]]     #only sample edges before current timestamp
-        self.graph_sampler.ts = current_ts    # restore the current timestamp to the graph sampler.
+        current_ts = self.g.edata['timestamp'][items[0]]  # only sample edges before current timestamp
+        self.graph_sampler.ts = current_ts  # restore the current timestamp to the graph sampler.
 
         # if link prefiction, we use a negative_sampler to generate neg-graph for loss computing.
         if self.negative_sampler is None:
@@ -727,14 +822,10 @@ class SimpleTemporalEdgeCollator(EdgeCollator):
             input_nodes, pair_graph, neg_pair_graph, blocks = self._collate_with_negative_sampling(items)
 
         # we sampling k-hop subgraph and batch them into one graph
-        for i in range(self.n_layer-1):
-            self.graph_sampler.frontiers[0].add_edges(*self.graph_sampler.frontiers[i+1].edges())
+        for i in range(self.n_layer - 1):
+            self.graph_sampler.frontiers[0].add_edges(*self.graph_sampler.frontiers[i + 1].edges())
         frontier = self.graph_sampler.frontiers[0]
         # computing node last-update timestamp
-        frontier.update_all(fn.copy_e('timestamp','ts'), fn.max('ts','timestamp'))
+        frontier.update_all(fn.copy_e('timestamp', 'ts'), fn.max('ts', 'timestamp'))
 
         return input_nodes, pair_graph, neg_pair_graph, [frontier]
-
-
-
-
