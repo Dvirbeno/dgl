@@ -29,10 +29,9 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
     batch_cnt = 0
     last_t = time.time()
 
-    for input_nodes, positive_pair_g, blocks in dataloader:
+    for input_nodes, pair_g, blocks in dataloader:
         optimizer.zero_grad()
-        pred_pos, pred_neg = model.embed(
-            positive_pair_g, negative_pair_g, blocks)
+        pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
         loss = criterion(pred_pos, torch.ones_like(pred_pos))
         loss += criterion(pred_neg, torch.zeros_like(pred_neg))
         total_loss += float(loss) * args.batch_size
@@ -74,6 +73,26 @@ def test_val(model, dataloader, sampler, criterion, args):
             aucs.append(roc_auc_score(y_true, y_pred))
             batch_cnt += 1
     return float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
+
+
+def decompose_batches(group_indicator):
+    # assume ordered
+    cur_group = None
+    cur_batch = None
+    batches_list = []
+
+    for idx, grp in enumerate(group_indicator):
+        if grp != cur_group:
+
+            if cur_batch is not None:
+                batches_list.append(cur_batch)
+            cur_batch = []
+            cur_group = grp
+
+        cur_batch.append(idx)
+
+    batches_list.append(cur_batch)
+    return batches_list
 
 
 if __name__ == "__main__":
@@ -135,6 +154,11 @@ if __name__ == "__main__":
 
     num_lasting_nodes = data.num_nodes('player')
     num_dispensable_nodes = data.num_nodes('match')
+
+    # make sure the dataset is sorted
+    assert torch.all(torch.diff(data.edges['plays'].data['timestamp']) >= 0)
+    src_id, dst_id, edge_id = data.edges('all', etype='plays')
+    assert torch.all(torch.diff(dst_id) >= 0)
 
     # set split according to preset fraction
     # =======================================
@@ -223,10 +247,39 @@ if __name__ == "__main__":
 
     train_seed, valid_seed, test_seed, test_new_node_seed = dict(), dict(), dict(), dict()
     for etype in data.canonical_etypes:  # get eids
-        train_seed[etype] = graph_no_new_node.edges('all', etype=etype)[-1][train_bool[etype]]
-        valid_seed[etype] = graph_no_new_node.edges('all', etype=etype)[-1][valid_bool[etype]]
-        test_seed[etype] = graph_no_new_node.edges('all', etype=etype)[-1][test_bool[etype]]
-        test_new_node_seed[etype] = graph_new_node.edges('all', etype=etype)[-1][test_new_node_bool[etype]]
+        # instead of iterating over etypes, only a single etype is required
+        is_match_source = etype.index('match') == 0
+
+        srcs, dsts, eids = graph_no_new_node.edges('all', etype=etype)
+        match_indicator = srcs if is_match_source else dsts
+
+        train_seed[etype] = eids[train_bool[etype]]
+        # train_batch_sampler = decompose_batches(match_indicator[train_bool[etype]])
+        train_batch_sampler = [
+            [1992222, 1992223, 1992224, 1992225, 1992226, 1992227, 1992228, 1992229, 1992230, 1992231, 1992232, 1992233,
+             1992234, 1992235, 1992236, 1992237, 1992238, 1992239, 1992240, 1992241, 1992242, 1992243, 1992244, 1992245,
+             1992246, 1992247, 1992248, 1992249, 1992250, 1992251, 1992252, 1992253, 1992254, 1992255, 1992256, 1992257,
+             1992258, 1992259, 1992260, 1992261, 1992262, 1992263, 1992264, 1992265, 1992266, 1992267, 1992268, 1992269,
+             1992270, 1992271, 1992272, 1992273, 1992274, 1992275, 1992276, 1992277, 1992278, 1992279, 1992280, 1992281,
+             1992282, 1992283, 1992284, 1992285, 1992286, 1992287, 1992288, 1992289, 1992290, 1992291, 1992292, 1992293,
+             1992294, 1992295, 1992296, 1992297, 1992298, 1992299, 1992300, 1992301, 1992302, 1992303, 1992304, 1992305,
+             1992306, 1992307, 1992308, 1992309, 1992310, 1992311, 1992312, 1992313, 1992314, 1992315, 1992316, 1992317,
+             1992318]]
+
+        valid_seed[etype] = eids[valid_bool[etype]]
+        # valid_batch_sampler = decompose_batches(match_indicator[valid_bool[etype]])
+
+        test_seed[etype] = eids[test_bool[etype]]
+        # test_batch_sampler = decompose_batches(match_indicator[test_bool[etype]])
+
+        srcs, dsts, eids = graph_new_node.edges('all', etype=etype)
+        match_indicator = srcs if is_match_source else dsts
+        test_new_node_seed[etype] = eids[test_new_node_bool[etype]]
+        # test_new_node_batch_sampler = decompose_batches(match_indicator[test_new_node_bool[etype]])
+
+        # currently - because there are just two types of edges, and they are also reversed with the same data,
+        # we don't need really need to consider the reverse edges (for the mirror etype) as seeds.
+        # Hence - break # TODO: consider what to do with it when teams are involved
 
     # train_edges_num = (1 + (graph_no_new_node.edata['timestamp'] <= train_last_ts).nonzero()[-1]).item()
     # train_seed = torch.arange(train_edges_num)
@@ -252,10 +305,11 @@ if __name__ == "__main__":
     train_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                               eids=train_seed,
                                               graph_sampler=sampler,
-                                              batch_size=args.batch_size,  # * 2500,  # TODO: change back
+                                              batch_sampler=train_batch_sampler,
+                                              # batch_size=args.batch_size,  # * 2500,  # TODO: change back
                                               negative_sampler=None,
-                                              shuffle=False,
-                                              drop_last=False,
+                                              # shuffle=False,
+                                              # drop_last=False,
                                               num_workers=0,
                                               collator=edge_collator,
                                               # g_sampling=g_sampling,

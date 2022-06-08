@@ -104,6 +104,7 @@ class TemporalSampler(BlockSampler):
         final_subgraph = self.sampler(g=temporal_subgraph, nodes=mapped_seed_nodes)
 
         # TODO: comment for a second
+        # removing the original edges
         if is_last:
             for edge_type in final_subgraph.canonical_etypes:
                 eid = final_subgraph.edge_ids(mapped_seed_nodes[edge_type[0]], mapped_seed_nodes[edge_type[-1]],
@@ -235,37 +236,24 @@ class TemporalEdgeCollator(EdgeCollator):
         pair_graph = dgl.transforms.compact_graphs(
             [pair_graph])[0]
 
-        # Need to remap id
-        for ntype in self.g.ntypes:
-            pair_graph.nodes[ntype].data[dgl.NID] = pair_graph.nodes(ntype)
+        # Need to remap id TODO: not sure if required
+        # for ntype in self.g.ntypes:
+        #     pair_graph.nodes[ntype].data[dgl.NID] = pair_graph.nodes(ntype)
         for etype in induced_edges.keys():
             pair_graph.edges[etype].data[dgl.EID] = induced_edges[etype]
 
-        batch_block_graphs = [[] for _ in range(self.graph_sampler.hops)]
-        blocks_dst = [[] for _ in range(self.graph_sampler.hops)]
-        nodes_id = {ntype: [] for ntype in self.g.ntypes}
-        timestamps = []
+        assert len(items) == 1  # only a single edge type
+        assert len(torch.unique(pair_graph.edata['timestamp'][list(items.keys())[0]])) == 1  # only a single timestamp
 
-        for etype in items.keys():
-            for i, edge in enumerate(
-                    zip(self.g.edges(etype=etype)[0][items[etype]], self.g.edges(etype=etype)[1][items[etype]])):
-                # TODO: LOSE THIS
-                # if i < 499001:
-                #     continue
-
-                ts = pair_graph.edges[etype].data['timestamp'][i]
-                timestamps.append(ts)
-                seed_nodes, output_nodes, blocks = self.graph_sampler.sample_blocks(self.g_sampling,
-                                                                                    {etype[0]: edge[0].unsqueeze(0),
-                                                                                     etype[-1]: edge[1].unsqueeze(0)},
-                                                                                    timestamp=ts,
-                                                                                    etype=etype)
-
-                # subg.ndata['timestamp'] = ts.repeat(subg.num_nodes())
-                for ntype, nids in seed_nodes.items():
-                    nodes_id[ntype].append(nids)
-                for idx, block in enumerate(blocks):
-                    batch_block_graphs[idx].append(dgl.convert.block_to_graph(block))
+        for etype in items.keys():  # should be a single iteration
+            all_sources, all_dest = self.g.edges(etype=etype)
+            ts = pair_graph.edges[etype].data['timestamp'][0]  # applies to the rest of the batch
+            input_nodes, output_nodes, blocks = self.graph_sampler.sample_blocks(self.g_sampling,
+                                                                                 {etype[0]: all_sources[
+                                                                                     items[etype]],
+                                                                                  etype[-1]: all_dest[items[etype]]},
+                                                                                 timestamp=ts,
+                                                                                 etype=etype)
 
         # for i, edge in enumerate(zip(self.g.edges()[0][items], self.g.edges()[1][items])):
         #     ts = pair_graph.edata['timestamp'][i]
@@ -277,8 +265,6 @@ class TemporalEdgeCollator(EdgeCollator):
         #     nodes_id.append(subg.srcdata[dgl.NID])
         #     batch_graphs.append(subg)
 
-        blocks = [dgl.batch(depthwise_subgraphs) for depthwise_subgraphs in batch_block_graphs]
-        input_nodes = {k: torch.cat(nodes_list) for k, nodes_list in nodes_id.items()}
         return input_nodes, pair_graph, blocks
 
     def _collate_with_negative_sampling(self, items):
